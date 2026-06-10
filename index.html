@@ -1680,7 +1680,11 @@
     show("splash");
     // betöltő képernyő után Auth ellenőrzés, majd indul a VÁLL. lista
     setTimeout(()=>{
-      try{ startAppAfterSplash(); }catch(e){ console.error(e); show("auth"); }
+      startAppAfterSplash().catch(e => {
+        console.error(e);
+        setAuthStatus("Nem sikerült elindítani az appot: " + (e.message || e), "dangerText");
+        show("auth");
+      });
     }, 1200);
 
     function hideKeyboard(){
@@ -1823,17 +1827,24 @@
     async function cloudDeleteTask(){ scheduleCloudSave(); }
     async function cloudSyncType(){ scheduleCloudSave(); }
 
+    function withTimeout(promise, ms, label){
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error((label || "Művelet") + " időtúllépés")), ms))
+      ]);
+    }
+
     async function startAppAfterSplash(){
       if(!supabaseReady){
         setAuthStatus("Add meg a SUPABASE_URL és SUPABASE_ANON_KEY értéket a HTML elején.", "dangerText");
         show("auth");
         return;
       }
-      const { data } = await supabaseClient.auth.getUser();
-      currentUser = data && data.user ? data.user : null;
-      if(!currentUser){ show("auth"); return; }
       try{
-        await loadCloudStore();
+        const { data } = await withTimeout(supabaseClient.auth.getSession(), 8000, "Supabase bejelentkezés ellenőrzés");
+        currentUser = data && data.session && data.session.user ? data.session.user : null;
+        if(!currentUser){ show("auth"); return; }
+        await withTimeout(loadCloudStore(), 10000, "Supabase adatok betöltése");
         currentMode = "business";
         purgeListDoneFromPreviousDays();
         syncCalendarTodayToList();
