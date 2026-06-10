@@ -1658,7 +1658,28 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    // Supabase könyvtár betöltése nem blokkoló módon.
+    // GitHub Pages-en a külső CDN script néha megakaszthatja az app indulását,
+    // ezért dinamikusan töltjük be, jsDelivr után unpkg tartalékkal.
+    window.__loadSupabaseLib = function(){
+      if(window.supabase) return Promise.resolve(true);
+      if(window.__supabaseLibPromise) return window.__supabaseLibPromise;
+      function load(src){
+        return new Promise((resolve, reject) => {
+          const sc = document.createElement("script");
+          sc.src = src;
+          sc.async = true;
+          sc.onload = () => resolve(true);
+          sc.onerror = () => reject(new Error("Nem töltődött be: " + src));
+          document.head.appendChild(sc);
+        });
+      }
+      window.__supabaseLibPromise = load("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2")
+        .catch(() => load("https://unpkg.com/@supabase/supabase-js@2"));
+      return window.__supabaseLibPromise;
+    };
+  </script>
 
   <script>
     // -------------------------
@@ -1702,8 +1723,20 @@
     const SUPABASE_TABLE = "carlink_store";
     const MYDAY_NAMESPACE = "myday";
 
-    const supabaseReady = !!(window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_ANON_KEY.includes("PASTE_"));
-    const supabaseClient = supabaseReady ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+    function hasSupabaseConfig(){
+      return !!(SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_ANON_KEY.includes("PASTE_"));
+    }
+    let supabaseClient = null;
+    async function ensureSupabaseClient(){
+      if(supabaseClient) return supabaseClient;
+      if(!hasSupabaseConfig()) return null;
+      if(!window.supabase){
+        await withTimeout(window.__loadSupabaseLib ? window.__loadSupabaseLib() : Promise.reject(new Error("Supabase könyvtár nem elérhető")), 6500, "Supabase könyvtár betöltése");
+      }
+      if(!window.supabase) return null;
+      supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      return supabaseClient;
+    }
     let currentUser = null;
     let appStore = { list: [], calendar: [], meta: {} };
     let cloudLoaded = false;
@@ -1835,12 +1868,13 @@
     }
 
     async function startAppAfterSplash(){
-      if(!supabaseReady){
-        setAuthStatus("Add meg a SUPABASE_URL és SUPABASE_ANON_KEY értéket a HTML elején.", "dangerText");
-        show("auth");
-        return;
-      }
       try{
+        await ensureSupabaseClient();
+        if(!supabaseClient){
+          setAuthStatus("A Supabase könyvtár vagy a SUPABASE_URL / SUPABASE_ANON_KEY nem elérhető. Ellenőrizd a GitHub Pages hálózati/CDN elérést.", "dangerText");
+          show("auth");
+          return;
+        }
         const { data } = await withTimeout(supabaseClient.auth.getSession(), 8000, "Supabase bejelentkezés ellenőrzés");
         currentUser = data && data.session && data.session.user ? data.session.user : null;
         if(!currentUser){ show("auth"); return; }
