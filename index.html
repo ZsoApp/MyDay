@@ -1702,6 +1702,9 @@
     let appStore = { list: [], calendar: [], meta: {} };
     let cloudLoaded = false;
     let saveTimer = null;
+    let cloudRowIds = [];
+    let cloudSaveInFlight = false;
+    let cloudSaveQueued = false;
 
     function setAuthStatus(msg, kind=""){
       const el = document.getElementById("authStatus");
@@ -1710,18 +1713,13 @@
       el.textContent = msg || "";
     }
 
-    function stripPrivateFields(task){
-      const clean = { ...(task || {}) };
-      delete clean._rowId;
-      clean.id = clean.id || uid();
-      return clean;
-    }
     function mapRowToTask(row){
       const data = row && row.data && typeof row.data === "object" ? row.data : {};
-      return { ...data, id: data.id || row.id || uid(), _rowId: row.id || null };
+      return { ...data, id: data.id || uid() };
     }
     function mapTaskToRow(task, type){
-      const clean = stripPrivateFields(task);
+      const clean = { ...(task || {}) };
+      clean.id = clean.id || uid();
       return {
         user_id: currentUser ? currentUser.id : null,
         task_type: type,
@@ -1733,94 +1731,82 @@
         done: !!clean.done
       };
     }
-    function taskFingerprint(task){
-      return JSON.stringify(stripPrivateFields(task));
+
+    function dedupeTasks(rows, wantedType){
+      const byId = new Map();
+      (rows || []).forEach(row => {
+        if(row.task_type !== wantedType) return;
+        const task = mapRowToTask(row);
+        if(!task || !task.id) return;
+        byId.set(task.id, task);
+      });
+      return Array.from(byId.values());
     }
 
     async function loadCloudStore(){
       if(!supabaseClient || !currentUser) return;
       const { data, error } = await supabaseClient
         .from(SUPABASE_TABLE)
-        .select("id,task_type,data")
+        .select("id,user_id,task_type,data,created_at")
         .eq("user_id", currentUser.id)
         .order("created_at", { ascending: true });
       if(error){ throw error; }
-      const list = [];
-      const calendar = [];
-      (data || []).forEach(row => {
-        const task = mapRowToTask(row);
-        if(row.task_type === "calendar") calendar.push(task);
-        else list.push(task);
-      });
-      appStore = { list, calendar, meta: appStore.meta || {} };
+      cloudRowIds = (data || []).map(row => row.id).filter(Boolean);
+      appStore = {
+        list: dedupeTasks(data, "list"),
+        calendar: dedupeTasks(data, "calendar"),
+        meta: appStore.meta || {}
+      };
       cloudLoaded = true;
-    }
-
-    async function cloudSaveTask(type, task){
-      if(!supabaseClient || !currentUser || !cloudLoaded || !task) return;
-      const row = mapTaskToRow(task, type);
-      try{
-        if(task._rowId){
-          const { error } = await supabaseClient
-            .from(SUPABASE_TABLE)
-            .update(row)
-            .eq("id", task._rowId)
-            .eq("user_id", currentUser.id);
-          if(error) throw error;
-        }else{
-          const { data, error } = await supabaseClient
-            .from(SUPABASE_TABLE)
-            .insert(row)
-            .select("id")
-            .single();
-          if(error) throw error;
-          if(data && data.id) task._rowId = data.id;
-        }
-      }catch(e){
-        console.error("Supabase mentési hiba:", e);
-        alert("Nem sikerült Supabase-be menteni. Ellenőrizd a táblát és az RLS szabályokat. Hiba: " + (e.message || e));
-      }
-    }
-
-    async function cloudDeleteTask(type, task){
-      if(!supabaseClient || !currentUser || !cloudLoaded || !task) return;
-      try{
-        let q = supabaseClient.from(SUPABASE_TABLE).delete().eq("user_id", currentUser.id).eq("task_type", type);
-        if(task._rowId) q = q.eq("id", task._rowId);
-        else if(task.id) q = q.eq("data->>id", task.id);
-        else return;
-        const { error } = await q;
-        if(error) throw error;
-      }catch(e){
-        console.error("Supabase törlési hiba:", e);
-        alert("Nem sikerült Supabase-ből törölni. Hiba: " + (e.message || e));
-      }
-    }
-
-    async function cloudSyncType(type, beforeArr, afterArr){
-      if(!supabaseClient || !currentUser || !cloudLoaded) return;
-      const before = Array.isArray(beforeArr) ? beforeArr : [];
-      const after = Array.isArray(afterArr) ? afterArr : [];
-      const afterById = new Map(after.map(t => [t.id, t]));
-      for(const oldTask of before){
-        if(oldTask && oldTask.id && !afterById.has(oldTask.id)) await cloudDeleteTask(type, oldTask);
-      }
-      const beforeById = new Map(before.map(t => [t.id, t]));
-      for(const task of after){
-        const oldTask = beforeById.get(task.id);
-        if(!oldTask || taskFingerprint(oldTask) !== taskFingerprint(task)) await cloudSaveTask(type, task);
-      }
     }
 
     async function persistCloudStoreNow(){
       if(!supabaseClient || !currentUser || !cloudLoaded) return;
-      await cloudSyncType("list", [], appStore.list || []);
-      await cloudSyncType("calendar", [], appStore.calendar || []);
+      if(cloudSaveInFlight){ cloudSaveQueued = true; return; }
+      cloudSaveInFlight = true;
+      cloudSaveQueued = false;
+
+      const oldRowIds = cloudRowIds.slice();
+      const rows = [
+        ...((appStore.list || []).map(t => mapTaskToRow(t, "list"))),
+        ...((appStore.calendar || []).map(t => mapTaskToRow(t, "calendar")))
+      ];
+
+      try{
+        let newRowIds = [];
+        if(rows.length){
+          const { data: inserted, error: insError } = await supabaseClient
+            .from(SUPABASE_TABLE)
+            .insert(rows)
+            .select("id");
+          if(insError) throw insError;
+          newRowIds = (inserted || []).map(row => row.id).filter(Boolean);
+        }
+
+        if(oldRowIds.length){
+          const { error: delError } = await supabaseClient
+            .from(SUPABASE_TABLE)
+            .delete()
+            .eq("user_id", currentUser.id)
+            .in("id", oldRowIds);
+          if(delError) throw delError;
+        }
+        cloudRowIds = newRowIds;
+      }catch(err){
+        console.error("Supabase mentési hiba:", err);
+        setAuthStatus("Mentési hiba: " + (err.message || err), "dangerText");
+      }finally{
+        cloudSaveInFlight = false;
+        if(cloudSaveQueued){
+          cloudSaveQueued = false;
+          persistCloudStoreNow();
+        }
+      }
     }
     function scheduleCloudSave(){
-      // A konkrét lista/naptár mentések azonnal szinkronizálnak; ez csak kompatibilitás miatt marad.
       if(!supabaseClient || !currentUser || !cloudLoaded) return;
       if(saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(()=>{ persistCloudStoreNow(); }, 250);
     }
 
     async function startAppAfterSplash(){
@@ -1880,6 +1866,7 @@
       if(supabaseClient) await supabaseClient.auth.signOut();
       currentUser = null;
       cloudLoaded = false;
+      cloudRowIds = [];
       appStore = { list: [], calendar: [], meta: {} };
       show("auth");
     }
@@ -2043,10 +2030,8 @@
     }
     function saveListTasks(tasks){
       const s = _readStore();
-      const before = Array.isArray(s.list) ? s.list.slice() : [];
       s.list = Array.isArray(tasks) ? tasks : [];
       _writeStore(s);
-      cloudSyncType("list", before, s.list);
     }
     function purgeListDoneFromPreviousDays(){
       const today = todayYMD();
@@ -2122,10 +2107,8 @@
     }
     function saveCalEvents(events){
       const s = _readStore();
-      const before = Array.isArray(s.calendar) ? s.calendar.slice() : [];
       s.calendar = Array.isArray(events) ? events : [];
       _writeStore(s);
-      cloudSyncType("calendar", before, s.calendar);
     }
 
     function getCalSinglesForDate(ymd){
