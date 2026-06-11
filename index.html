@@ -1808,7 +1808,7 @@
         if(row.task_type === "calendar") calendar.push(task);
         else list.push(task);
       });
-      appStore = { list, calendar, meta: appStore.meta || {} };
+      appStore = { list, calendar: dedupeCalEvents(calendar), meta: appStore.meta || {} };
       cloudLoaded = true;
     }
 
@@ -2150,6 +2150,53 @@
     // -------------------------
     // CAL DB (single + range)
     // -------------------------
+
+    function stableHash(str){
+      str = String(str || "");
+      let h = 2166136261;
+      for(let i=0;i<str.length;i++){
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return (h >>> 0).toString(16);
+    }
+
+    function calIdentityKey(e){
+      if(!e || typeof e !== "object") return "";
+      const type = e.type || "single";
+      const title = String(e.title || "").trim().toLowerCase();
+      const time = String(e.time || "").trim();
+      const mode = e.mode || "personal";
+      if(type === "range"){
+        const r = clampRange(e.from || "", e.to || "");
+        return ["range", title, r.from || "", r.to || "", time, mode].join("|");
+      }
+      return ["single", title, e.date || "", time, mode].join("|");
+    }
+
+    function stableCalId(e){
+      if(e && e.id) return e.id;
+      const base = calIdentityKey(e) + "|" + (e && e.createdAt ? e.createdAt : "");
+      return "cal-" + stableHash(base);
+    }
+
+    function dedupeCalEvents(events){
+      const arr = Array.isArray(events) ? events : [];
+      const byKey = new Map();
+      for(const raw of arr){
+        const n = normalizeCalEvent(raw);
+        if(!n || !n.title) continue;
+        const key = calIdentityKey(n);
+        const prev = byKey.get(key);
+        if(!prev){
+          byKey.set(key, n);
+          continue;
+        }
+        // Ha ugyanaz az esemény kétszer szerepel, tartsuk meg azt, amelyikhez már van Supabase sorazonosító.
+        if(!prev._rowId && n._rowId) byKey.set(key, n);
+      }
+      return Array.from(byKey.values());
+    }
     function normalizeCalEvent(e){
       if(!e || typeof e !== "object") return null;
       const type = e.type || "single";
@@ -2157,25 +2204,27 @@
         if(!e.from || !e.to) return null;
         const r = clampRange(e.from, e.to);
         return {
-          id: e.id || uid(),
+          id: stableCalId(e),
           type: "range",
           title: String(e.title||"").trim(),
           from: r.from,
           to: r.to,
           time: String(e.time||"").trim(),
           mode: e.mode || "personal",
-          createdAt: e.createdAt || Date.now()
+          createdAt: e.createdAt || Date.now(),
+          _rowId: e._rowId || null
         };
       }
       if(!e.date) return null;
       return {
-        id: e.id || uid(),
+        id: stableCalId(e),
         type: "single",
         title: String(e.title||"").trim(),
         date: e.date,
         time: String(e.time||"").trim(),
         mode: e.mode || "personal",
-        createdAt: e.createdAt || Date.now()
+        createdAt: e.createdAt || Date.now(),
+        _rowId: e._rowId || null
       };
     }
 
@@ -2194,7 +2243,7 @@
     function saveCalEvents(events){
       const s = _readStore();
       const before = Array.isArray(s.calendar) ? s.calendar.slice() : [];
-      s.calendar = Array.isArray(events) ? events : [];
+      s.calendar = dedupeCalEvents(events);
       _writeStore(s);
       cloudSyncType("calendar", before, s.calendar);
     }
@@ -3138,7 +3187,7 @@
           return;
         }
 
-        all.push({
+        const nextRange = {
           id: uid(),
           type: "range",
           title,
@@ -3147,7 +3196,11 @@
           time: (cTime.value || "").trim(),
           mode: calAddMode,
           createdAt: now
-        });
+        };
+
+        if(!all.some(e => calIdentityKey(e) === calIdentityKey(nextRange))){
+          all.push(nextRange);
+        }
 
         selectedDate = rr.from;
         calWeekStart = mondayStart(parseYMD(rr.from));
@@ -3160,7 +3213,7 @@
           return;
         }
 
-        all.push({
+        const nextSingle = {
           id: uid(),
           type: "single",
           title,
@@ -3168,7 +3221,11 @@
           time: (cTime.value || "").trim(),
           mode: calAddMode,
           createdAt: now
-        });
+        };
+
+        if(!all.some(e => calIdentityKey(e) === calIdentityKey(nextSingle))){
+          all.push(nextSingle);
+        }
         selectedDate = date;
       }
 
