@@ -1658,28 +1658,7 @@
     </div>
   </div>
 
-  <script>
-    // Supabase könyvtár betöltése nem blokkoló módon.
-    // GitHub Pages-en a külső CDN script néha megakaszthatja az app indulását,
-    // ezért dinamikusan töltjük be, jsDelivr után unpkg tartalékkal.
-    window.__loadSupabaseLib = function(){
-      if(window.supabase) return Promise.resolve(true);
-      if(window.__supabaseLibPromise) return window.__supabaseLibPromise;
-      function load(src){
-        return new Promise((resolve, reject) => {
-          const sc = document.createElement("script");
-          sc.src = src;
-          sc.async = true;
-          sc.onload = () => resolve(true);
-          sc.onerror = () => reject(new Error("Nem töltődött be: " + src));
-          document.head.appendChild(sc);
-        });
-      }
-      window.__supabaseLibPromise = load("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2")
-        .catch(() => load("https://unpkg.com/@supabase/supabase-js@2"));
-      return window.__supabaseLibPromise;
-    };
-  </script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
   <script>
     // -------------------------
@@ -1716,33 +1695,17 @@
     // -------------------------
     // Supabase Auth + felhős adatbázis
     // -------------------------
-    // Ugyanaz a stabil mentési minta, mint a működő appban:
-    // 1 user = 1 sor, a teljes app állapota JSON-ben.
+    // MyDay saját Supabase projektje. Ne cseréld ki a másik app adataira.
     const SUPABASE_URL = "https://xrzlsylveftjpabqmyxx.supabase.co";
     const SUPABASE_ANON_KEY = "sb_publishable_2BW0tdHtN3tRsAKXuaG6hA_ueREezbE";
     const SUPABASE_TABLE = "tasks";
-    const MYDAY_NAMESPACE = "myday";
 
-    function hasSupabaseConfig(){
-      return !!(SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_ANON_KEY.includes("PASTE_"));
-    }
-    let supabaseClient = null;
-    async function ensureSupabaseClient(){
-      if(supabaseClient) return supabaseClient;
-      if(!hasSupabaseConfig()) return null;
-      if(!window.supabase){
-        await withTimeout(window.__loadSupabaseLib ? window.__loadSupabaseLib() : Promise.reject(new Error("Supabase könyvtár nem elérhető")), 6500, "Supabase könyvtár betöltése");
-      }
-      if(!window.supabase) return null;
-      supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      return supabaseClient;
-    }
+    const supabaseReady = !!(window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_ANON_KEY.includes("PASTE_"));
+    const supabaseClient = supabaseReady ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
     let currentUser = null;
     let appStore = { list: [], calendar: [], meta: {} };
     let cloudLoaded = false;
     let saveTimer = null;
-    let savingCloud = false;
-    let pendingCloudSave = false;
 
     function setAuthStatus(msg, kind=""){
       const el = document.getElementById("authStatus");
@@ -1751,134 +1714,146 @@
       el.textContent = msg || "";
     }
 
-    function normalizeStore(store){
-      const s = (store && typeof store === "object") ? store : {};
+    function stripPrivateFields(task){
+      const clean = { ...(task || {}) };
+      delete clean._rowId;
+      clean.id = clean.id || uid();
+      return clean;
+    }
+
+    function mapRowToTask(row){
+      const data = row && row.data && typeof row.data === "object" ? row.data : {};
+      return { ...data, id: data.id || row.id || uid(), _rowId: row.id || null };
+    }
+
+    function mapTaskToRow(task, type){
+      const clean = stripPrivateFields(task);
       return {
-        list: Array.isArray(s.list) ? s.list : [],
-        calendar: Array.isArray(s.calendar) ? s.calendar : [],
-        meta: (s.meta && typeof s.meta === "object") ? s.meta : {}
+        user_id: currentUser ? currentUser.id : null,
+        task_type: type,
+        data: clean,
+        title: clean.title || "",
+        mode: clean.mode || "personal",
+        task_date: clean.date || clean.from || null,
+        task_time: clean.time || null,
+        done: !!clean.done,
+        updated_at: new Date().toISOString()
       };
     }
 
-    function getMyDayStoreFromCloudData(root){
-      const data = (root && typeof root === "object") ? root : {};
-      if(data[MYDAY_NAMESPACE] && typeof data[MYDAY_NAMESPACE] === "object"){
-        return normalizeStore(data[MYDAY_NAMESPACE]);
-      }
-      // Migráció / kompatibilitás: ha valaha top-level list/calendar volt mentve, azt is beolvassa.
-      if(Array.isArray(data.list) || Array.isArray(data.calendar) || (data.meta && typeof data.meta === "object")){
-        return normalizeStore(data);
-      }
-      return { list: [], calendar: [], meta: {} };
-    }
-
-    function cleanStoreForCloud(store){
-      const s = normalizeStore(store);
-      // A régi soronkénti mentésből maradt belső _rowId mezőket nem visszük tovább.
-      const cleanItem = (item) => {
-        const x = { ...(item || {}) };
-        delete x._rowId;
-        return x;
-      };
-      return {
-        list: s.list.map(cleanItem),
-        calendar: s.calendar.map(cleanItem),
-        meta: s.meta
-      };
+    function taskFingerprint(task){
+      return JSON.stringify(stripPrivateFields(task));
     }
 
     async function loadCloudStore(){
       if(!supabaseClient || !currentUser) return;
       const { data, error } = await supabaseClient
         .from(SUPABASE_TABLE)
-        .select("data")
+        .select("id,task_type,data")
         .eq("user_id", currentUser.id)
-        .maybeSingle();
-      if(error){ throw error; }
-      appStore = getMyDayStoreFromCloudData(data && data.data);
+        .order("created_at", { ascending: true });
+      if(error) throw error;
+
+      const list = [];
+      const calendar = [];
+      (data || []).forEach(row => {
+        const task = mapRowToTask(row);
+        if(row.task_type === "calendar") calendar.push(task);
+        else list.push(task);
+      });
+      appStore = { list, calendar, meta: appStore.meta || {} };
       cloudLoaded = true;
     }
 
-    async function flushCloudSave(){
-      if(!supabaseClient || !currentUser || !cloudLoaded) return;
-      if(savingCloud) return;
-      if(!pendingCloudSave) return;
-
-      savingCloud = true;
-      pendingCloudSave = false;
+    async function cloudSaveTask(type, task){
+      if(!supabaseClient || !currentUser || !cloudLoaded || !task) return;
+      const row = mapTaskToRow(task, type);
       try{
-        const { data, error } = await supabaseClient
-          .from(SUPABASE_TABLE)
-          .select("data")
-          .eq("user_id", currentUser.id)
-          .maybeSingle();
-        if(error) throw error;
-
-        const root = (data && data.data && typeof data.data === "object") ? data.data : {};
-        root[MYDAY_NAMESPACE] = cleanStoreForCloud(appStore);
-
-        const payload = {
-          user_id: currentUser.id,
-          data: root,
-          updated_at: new Date().toISOString()
-        };
-
-        const { error: saveError } = await supabaseClient
-          .from(SUPABASE_TABLE)
-          .upsert(payload, { onConflict: "user_id" });
-        if(saveError) throw saveError;
+        if(task._rowId){
+          const { error } = await supabaseClient
+            .from(SUPABASE_TABLE)
+            .update(row)
+            .eq("id", task._rowId)
+            .eq("user_id", currentUser.id);
+          if(error) throw error;
+        }else{
+          const { data, error } = await supabaseClient
+            .from(SUPABASE_TABLE)
+            .insert(row)
+            .select("id")
+            .single();
+          if(error) throw error;
+          if(data && data.id) task._rowId = data.id;
+        }
       }catch(e){
         console.error("Supabase mentési hiba:", e);
-        pendingCloudSave = true;
-      }finally{
-        savingCloud = false;
-        if(pendingCloudSave){
-          setTimeout(flushCloudSave, 400);
+        alert("Nem sikerült Supabase-be menteni. Hiba: " + (e.message || e));
+      }
+    }
+
+    async function cloudDeleteTask(type, task){
+      if(!supabaseClient || !currentUser || !cloudLoaded || !task) return;
+      try{
+        let q = supabaseClient
+          .from(SUPABASE_TABLE)
+          .delete()
+          .eq("user_id", currentUser.id)
+          .eq("task_type", type);
+        if(task._rowId) q = q.eq("id", task._rowId);
+        else if(task.id) q = q.eq("data->>id", task.id);
+        else return;
+        const { error } = await q;
+        if(error) throw error;
+      }catch(e){
+        console.error("Supabase törlési hiba:", e);
+        alert("Nem sikerült Supabase-ből törölni. Hiba: " + (e.message || e));
+      }
+    }
+
+    async function cloudSyncType(type, beforeArr, afterArr){
+      if(!supabaseClient || !currentUser || !cloudLoaded) return;
+      const before = Array.isArray(beforeArr) ? beforeArr : [];
+      const after = Array.isArray(afterArr) ? afterArr : [];
+      const afterById = new Map(after.map(t => [t.id, t]));
+
+      for(const oldTask of before){
+        if(oldTask && oldTask.id && !afterById.has(oldTask.id)){
+          await cloudDeleteTask(type, oldTask);
+        }
+      }
+
+      const beforeById = new Map(before.map(t => [t.id, t]));
+      for(const task of after){
+        const oldTask = beforeById.get(task.id);
+        if(!oldTask || taskFingerprint(oldTask) !== taskFingerprint(task)){
+          await cloudSaveTask(type, task);
         }
       }
     }
 
     async function persistCloudStoreNow(){
       if(!supabaseClient || !currentUser || !cloudLoaded) return;
-      pendingCloudSave = true;
-      if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
-      await flushCloudSave();
+      await cloudSyncType("list", [], appStore.list || []);
+      await cloudSyncType("calendar", [], appStore.calendar || []);
     }
 
     function scheduleCloudSave(){
-      if(!supabaseClient || !currentUser || !cloudLoaded) return;
-      pendingCloudSave = true;
+      // A lista/naptár mentések közvetlenül a saveListTasks/saveCalEvents után szinkronizálnak.
       if(saveTimer) clearTimeout(saveTimer);
-      saveTimer = setTimeout(async () => {
-        saveTimer = null;
-        await flushCloudSave();
-      }, 500);
-    }
-
-    // A régi lista/naptár hívások kompatibilitása: innentől a teljes store mentődik.
-    async function cloudSaveTask(){ scheduleCloudSave(); }
-    async function cloudDeleteTask(){ scheduleCloudSave(); }
-    async function cloudSyncType(){ scheduleCloudSave(); }
-
-    function withTimeout(promise, ms, label){
-      return Promise.race([
-        promise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error((label || "Művelet") + " időtúllépés")), ms))
-      ]);
+      saveTimer = null;
     }
 
     async function startAppAfterSplash(){
+      if(!supabaseReady){
+        setAuthStatus("A Supabase könyvtár vagy a SUPABASE_URL / SUPABASE_ANON_KEY nem elérhető.", "dangerText");
+        show("auth");
+        return;
+      }
+      const { data } = await supabaseClient.auth.getUser();
+      currentUser = data && data.user ? data.user : null;
+      if(!currentUser){ show("auth"); return; }
       try{
-        await ensureSupabaseClient();
-        if(!supabaseClient){
-          setAuthStatus("A Supabase könyvtár vagy a SUPABASE_URL / SUPABASE_ANON_KEY nem elérhető. Ellenőrizd a GitHub Pages hálózati/CDN elérést.", "dangerText");
-          show("auth");
-          return;
-        }
-        const { data } = await withTimeout(supabaseClient.auth.getSession(), 8000, "Supabase bejelentkezés ellenőrzés");
-        currentUser = data && data.session && data.session.user ? data.session.user : null;
-        if(!currentUser){ show("auth"); return; }
-        await withTimeout(loadCloudStore(), 10000, "Supabase adatok betöltése");
+        await loadCloudStore();
         currentMode = "business";
         purgeListDoneFromPreviousDays();
         syncCalendarTodayToList();
@@ -1904,6 +1879,7 @@
       if(regBtn) regBtn.classList.toggle("active", authMode === "register");
       setAuthStatus("");
     }
+
     async function submitAuth(){
       if(!supabaseReady){ setAuthStatus("Előbb add meg a Supabase URL-t és anon kulcsot a HTML-ben.", "dangerText"); return; }
       const email = (document.getElementById("authEmail")?.value || "").trim();
@@ -1921,6 +1897,7 @@
       currentUser = res.data.user || (res.data.session && res.data.session.user) || null;
       await startAppAfterSplash();
     }
+
     async function logout(){
       if(supabaseClient) await supabaseClient.auth.signOut();
       currentUser = null;
