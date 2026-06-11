@@ -1658,7 +1658,28 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    // Supabase könyvtár betöltése nem blokkoló módon.
+    // GitHub Pages-en a külső CDN script néha megakaszthatja az app indulását,
+    // ezért dinamikusan töltjük be, jsDelivr után unpkg tartalékkal.
+    window.__loadSupabaseLib = function(){
+      if(window.supabase) return Promise.resolve(true);
+      if(window.__supabaseLibPromise) return window.__supabaseLibPromise;
+      function load(src){
+        return new Promise((resolve, reject) => {
+          const sc = document.createElement("script");
+          sc.src = src;
+          sc.async = true;
+          sc.onload = () => resolve(true);
+          sc.onerror = () => reject(new Error("Nem töltődött be: " + src));
+          document.head.appendChild(sc);
+        });
+      }
+      window.__supabaseLibPromise = load("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2")
+        .catch(() => load("https://unpkg.com/@supabase/supabase-js@2"));
+      return window.__supabaseLibPromise;
+    };
+  </script>
 
   <script>
     // -------------------------
@@ -1695,17 +1716,45 @@
     // -------------------------
     // Supabase Auth + felhős adatbázis
     // -------------------------
-    // MyDay saját Supabase projektje. Ne cseréld ki a másik app adataira.
+    // MyDay eredeti Supabase projekt + soronkénti tasks tábla.
+    // Fontos: itt NINCS carlink_store és NINCS onConflict:user_id.
     const SUPABASE_URL = "https://xrzlsylveftjpabqmyxx.supabase.co";
     const SUPABASE_ANON_KEY = "sb_publishable_2BW0tdHtN3tRsAKXuaG6hA_ueREezbE";
     const SUPABASE_TABLE = "tasks";
 
-    const supabaseReady = !!(window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_ANON_KEY.includes("PASTE_"));
-    const supabaseClient = supabaseReady ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+    let supabaseClient = null;
+    let supabaseReady = false;
     let currentUser = null;
     let appStore = { list: [], calendar: [], meta: {} };
     let cloudLoaded = false;
     let saveTimer = null;
+
+    function hasSupabaseConfig(){
+      return !!(SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_ANON_KEY.includes("PASTE_"));
+    }
+
+    function withTimeout(promise, ms, label){
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error((label || "Művelet") + " időtúllépés")), ms))
+      ]);
+    }
+
+    async function ensureSupabaseClient(){
+      if(supabaseClient){ supabaseReady = true; return supabaseClient; }
+      if(!hasSupabaseConfig()){ supabaseReady = false; return null; }
+      if(!window.supabase){
+        await withTimeout(
+          window.__loadSupabaseLib ? window.__loadSupabaseLib() : Promise.reject(new Error("Supabase könyvtár nem elérhető")),
+          8000,
+          "Supabase könyvtár betöltése"
+        );
+      }
+      if(!window.supabase){ supabaseReady = false; return null; }
+      supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      supabaseReady = true;
+      return supabaseClient;
+    }
 
     function setAuthStatus(msg, kind=""){
       const el = document.getElementById("authStatus");
@@ -1736,8 +1785,7 @@
         mode: clean.mode || "personal",
         task_date: clean.date || clean.from || null,
         task_time: clean.time || null,
-        done: !!clean.done,
-        updated_at: new Date().toISOString()
+        done: !!clean.done
       };
     }
 
@@ -1752,8 +1800,7 @@
         .select("id,task_type,data")
         .eq("user_id", currentUser.id)
         .order("created_at", { ascending: true });
-      if(error) throw error;
-
+      if(error){ throw error; }
       const list = [];
       const calendar = [];
       (data || []).forEach(row => {
@@ -1794,11 +1841,7 @@
     async function cloudDeleteTask(type, task){
       if(!supabaseClient || !currentUser || !cloudLoaded || !task) return;
       try{
-        let q = supabaseClient
-          .from(SUPABASE_TABLE)
-          .delete()
-          .eq("user_id", currentUser.id)
-          .eq("task_type", type);
+        let q = supabaseClient.from(SUPABASE_TABLE).delete().eq("user_id", currentUser.id).eq("task_type", type);
         if(task._rowId) q = q.eq("id", task._rowId);
         else if(task.id) q = q.eq("data->>id", task.id);
         else return;
@@ -1814,20 +1857,15 @@
       if(!supabaseClient || !currentUser || !cloudLoaded) return;
       const before = Array.isArray(beforeArr) ? beforeArr : [];
       const after = Array.isArray(afterArr) ? afterArr : [];
-      const afterById = new Map(after.map(t => [t.id, t]));
-
+      const afterById = new Map(after.map(t => [t && t.id, t]));
       for(const oldTask of before){
-        if(oldTask && oldTask.id && !afterById.has(oldTask.id)){
-          await cloudDeleteTask(type, oldTask);
-        }
+        if(oldTask && oldTask.id && !afterById.has(oldTask.id)) await cloudDeleteTask(type, oldTask);
       }
-
-      const beforeById = new Map(before.map(t => [t.id, t]));
+      const beforeById = new Map(before.map(t => [t && t.id, t]));
       for(const task of after){
+        if(!task || !task.id) continue;
         const oldTask = beforeById.get(task.id);
-        if(!oldTask || taskFingerprint(oldTask) !== taskFingerprint(task)){
-          await cloudSaveTask(type, task);
-        }
+        if(!oldTask || taskFingerprint(oldTask) !== taskFingerprint(task)) await cloudSaveTask(type, task);
       }
     }
 
@@ -1838,22 +1876,24 @@
     }
 
     function scheduleCloudSave(){
-      // A lista/naptár mentések közvetlenül a saveListTasks/saveCalEvents után szinkronizálnak.
+      // A konkrét lista/naptár mentések azonnal szinkronizálnak.
+      // Ez a függvény kompatibilitás miatt marad, de nem indít hibás upsertet.
       if(saveTimer) clearTimeout(saveTimer);
       saveTimer = null;
     }
 
     async function startAppAfterSplash(){
-      if(!supabaseReady){
-        setAuthStatus("A Supabase könyvtár vagy a SUPABASE_URL / SUPABASE_ANON_KEY nem elérhető.", "dangerText");
-        show("auth");
-        return;
-      }
-      const { data } = await supabaseClient.auth.getUser();
-      currentUser = data && data.user ? data.user : null;
-      if(!currentUser){ show("auth"); return; }
       try{
-        await loadCloudStore();
+        await ensureSupabaseClient();
+        if(!supabaseClient){
+          setAuthStatus("Add meg a SUPABASE_URL és SUPABASE_ANON_KEY értéket a HTML-ben, vagy ellenőrizd a Supabase CDN betöltését.", "dangerText");
+          show("auth");
+          return;
+        }
+        const { data } = await withTimeout(supabaseClient.auth.getUser(), 8000, "Supabase bejelentkezés ellenőrzés");
+        currentUser = data && data.user ? data.user : null;
+        if(!currentUser){ show("auth"); return; }
+        await withTimeout(loadCloudStore(), 10000, "Supabase adatok betöltése");
         currentMode = "business";
         purgeListDoneFromPreviousDays();
         syncCalendarTodayToList();
@@ -1881,25 +1921,31 @@
     }
 
     async function submitAuth(){
-      if(!supabaseReady){ setAuthStatus("Előbb add meg a Supabase URL-t és anon kulcsot a HTML-ben.", "dangerText"); return; }
-      const email = (document.getElementById("authEmail")?.value || "").trim();
-      const password = (document.getElementById("authPassword")?.value || "").trim();
-      if(!email || !password){ setAuthStatus("E-mail és jelszó szükséges.", "dangerText"); return; }
-      setAuthStatus(authMode === "login" ? "Belépés…" : "Regisztráció…");
-      const res = authMode === "login"
-        ? await supabaseClient.auth.signInWithPassword({ email, password })
-        : await supabaseClient.auth.signUp({ email, password });
-      if(res.error){ setAuthStatus(res.error.message, "dangerText"); return; }
-      if(authMode === "register" && !res.data.session){
-        setAuthStatus("Regisztráció kész. Ha be van kapcsolva az e-mail megerősítés, erősítsd meg a levelet, majd lépj be.", "okText");
-        return;
+      try{
+        await ensureSupabaseClient();
+        if(!supabaseClient){ setAuthStatus("A Supabase nem elérhető. Ellenőrizd az URL-t, kulcsot és a CDN betöltést.", "dangerText"); return; }
+        const email = (document.getElementById("authEmail")?.value || "").trim();
+        const password = (document.getElementById("authPassword")?.value || "").trim();
+        if(!email || !password){ setAuthStatus("E-mail és jelszó szükséges.", "dangerText"); return; }
+        setAuthStatus(authMode === "login" ? "Belépés…" : "Regisztráció…");
+        const res = authMode === "login"
+          ? await supabaseClient.auth.signInWithPassword({ email, password })
+          : await supabaseClient.auth.signUp({ email, password });
+        if(res.error){ setAuthStatus(res.error.message, "dangerText"); return; }
+        if(authMode === "register" && !res.data.session){
+          setAuthStatus("Regisztráció kész. Ha be van kapcsolva az e-mail megerősítés, erősítsd meg a levelet, majd lépj be.", "okText");
+          return;
+        }
+        currentUser = res.data.user || (res.data.session && res.data.session.user) || null;
+        await startAppAfterSplash();
+      }catch(e){
+        console.error("Supabase auth hiba:", e);
+        setAuthStatus("Belépési hiba: " + (e.message || e), "dangerText");
       }
-      currentUser = res.data.user || (res.data.session && res.data.session.user) || null;
-      await startAppAfterSplash();
     }
 
     async function logout(){
-      if(supabaseClient) await supabaseClient.auth.signOut();
+      try{ if(supabaseClient) await supabaseClient.auth.signOut(); }catch(e){ console.error("Kilépési hiba:", e); }
       currentUser = null;
       cloudLoaded = false;
       appStore = { list: [], calendar: [], meta: {} };
@@ -2061,7 +2107,10 @@
     // -------------------------
     function loadListTasks(){
       const s = _readStore();
-      return Array.isArray(s.list) ? s.list : [];
+      const arr = Array.isArray(s.list) ? s.list : [];
+      // Másolatot adunk vissza, hogy a felvitel/törlés/készre állítás ne módosítsa
+      // az appStore-t még a saveListTasks() előtti összehasonlítás előtt.
+      return arr.map(t => ({ ...(t || {}) }));
     }
     function saveListTasks(tasks){
       const s = _readStore();
